@@ -158,52 +158,69 @@ class TD3(OffPolicyAlgorithm):
         # Update learning rate according to lr schedule
         self._update_learning_rate([self.actor.optimizer, self.critic.optimizer])
 
+
+        replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+
+        # Initialize CUDA graph
+        g = th.cuda.CUDAGraph()
+
+        # Use a separate CUDA stream for capturing the graph
+        stream = th.cuda.Stream()
+        th.cuda.set_stream(stream)
+
+        # Pre-allocate buffers for actions, Q-values, etc. for re-use
         actor_losses, critic_losses = [], []
+        with th.cuda.graph(g):
+            for _ in range(gradient_steps):
+                self._n_updates += 1
+                # Sample replay buffer (with same shape)
+                replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+
+                with th.no_grad():
+                    # Add noise to the next actions
+                    noise = replay_data.actions.clone().data.normal_(0, self.target_policy_noise)
+                    noise = noise.clamp(-self.target_noise_clip, self.target_noise_clip)
+                    next_actions = (self.actor_target(replay_data.next_observations) + noise).clamp(-1, 1)
+
+                    # Compute next Q-values, taking the min over all critics
+                    next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
+                    next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
+                    target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
+
+                # Get current Q-values from the critics
+                current_q_values = self.critic(replay_data.observations, replay_data.actions)
+
+                # Compute critic loss (sum of MSE losses across critics)
+                critic_loss = sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
+
+                # Optimize the critic
+                self.critic.optimizer.zero_grad(set_to_none=True)
+                critic_loss.backward()
+                self.critic.optimizer.step()
+
+                # Delayed policy update
+                if self._n_updates % self.policy_delay == 0:
+                    # Compute actor loss
+                    actor_loss = -self.critic.q1_forward(replay_data.observations,
+                                                         self.actor(replay_data.observations)).mean()
+
+                    # Optimize the actor
+                    self.actor.optimizer.zero_grad(set_to_none=True)
+                    actor_loss.backward()
+                    self.actor.optimizer.step()
+
+                    # Perform Polyak averaging
+                    polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
+                    polyak_update(self.actor.parameters(), self.actor_target.parameters(), self.tau)
+                    polyak_update(self.critic_batch_norm_stats, self.critic_batch_norm_stats_target, 1.0)
+                    polyak_update(self.actor_batch_norm_stats, self.actor_batch_norm_stats_target, 1.0)
+
+        # Synchronize the stream
+        th.cuda.synchronize()
+
+        # Replay the graph
         for _ in range(gradient_steps):
-            self._n_updates += 1
-            # Sample replay buffer
-            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
-
-            with th.no_grad():
-                # Select action according to policy and add clipped noise
-                noise = replay_data.actions.clone().data.normal_(0, self.target_policy_noise)
-                noise = noise.clamp(-self.target_noise_clip, self.target_noise_clip)
-                next_actions = (self.actor_target(replay_data.next_observations) + noise).clamp(-1, 1)
-
-                # Compute the next Q-values: min over all critics targets
-                next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
-                next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
-                target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
-
-            # Get current Q-values estimates for each critic network
-            current_q_values = self.critic(replay_data.observations, replay_data.actions)
-
-            # Compute critic loss
-            critic_loss = sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
-            assert isinstance(critic_loss, th.Tensor)
-            critic_losses.append(critic_loss.item())
-
-            # Optimize the critics
-            self.critic.optimizer.zero_grad()
-            critic_loss.backward()
-            self.critic.optimizer.step()
-
-            # Delayed policy updates
-            if self._n_updates % self.policy_delay == 0:
-                # Compute actor loss
-                actor_loss = -self.critic.q1_forward(replay_data.observations, self.actor(replay_data.observations)).mean()
-                actor_losses.append(actor_loss.item())
-
-                # Optimize the actor
-                self.actor.optimizer.zero_grad()
-                actor_loss.backward()
-                self.actor.optimizer.step()
-
-                polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
-                polyak_update(self.actor.parameters(), self.actor_target.parameters(), self.tau)
-                # Copy running stats, see GH issue #996
-                polyak_update(self.critic_batch_norm_stats, self.critic_batch_norm_stats_target, 1.0)
-                polyak_update(self.actor_batch_norm_stats, self.actor_batch_norm_stats_target, 1.0)
+            g.replay()
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         if len(actor_losses) > 0:
