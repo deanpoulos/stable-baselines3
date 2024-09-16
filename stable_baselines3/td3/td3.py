@@ -9,7 +9,7 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
-from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
+from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule, ReplayBufferSamples
 from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
 from stable_baselines3.td3.policies import Actor, CnnPolicy, MlpPolicy, MultiInputPolicy, TD3Policy
 
@@ -158,8 +158,14 @@ class TD3(OffPolicyAlgorithm):
         # Update learning rate according to lr schedule
         self._update_learning_rate([self.actor.optimizer, self.critic.optimizer])
 
-
         replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+
+        # Pre-allocate noise and next_actions (buffers must be pre-initialized)
+        noise = th.zeros_like(replay_data.actions, device='cuda')
+        next_actions = th.zeros_like(replay_data.actions, device='cuda')
+        target_q_values = th.zeros_like(replay_data.rewards, device='cuda')
+        critic_losses = []
+        actor_losses = []
 
         # Initialize CUDA graph
         g = th.cuda.CUDAGraph()
@@ -168,37 +174,37 @@ class TD3(OffPolicyAlgorithm):
         stream = th.cuda.Stream()
         th.cuda.set_stream(stream)
 
-        # Pre-allocate buffers for actions, Q-values, etc. for re-use
-        actor_losses, critic_losses = [], []
-        with th.cuda.graph(g):
-            for _ in range(gradient_steps):
-                self._n_updates += 1
-                # Sample replay buffer (with same shape)
-                replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+        # Warm-up step (execute operations once to ensure memory allocations)
+        for _ in range(gradient_steps):
+            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+            replay_data = ReplayBufferSamples(*tuple(map(lambda x: x.to('cuda'), replay_data)))
 
-                with th.no_grad():
-                    # Add noise to the next actions
-                    noise = replay_data.actions.clone().data.normal_(0, self.target_policy_noise)
-                    noise = noise.clamp(-self.target_noise_clip, self.target_noise_clip)
-                    next_actions = (self.actor_target(replay_data.next_observations) + noise).clamp(-1, 1)
+            with th.no_grad():
+                # Pre-calculate next actions
+                noise.copy_(
+                    replay_data.actions.clone().normal_(0, self.target_policy_noise).clamp(-self.target_noise_clip,
+                                                                                           self.target_noise_clip))
+                next_actions.copy_((self.actor_target(replay_data.next_observations) + noise).clamp(-1, 1))
 
-                    # Compute next Q-values, taking the min over all critics
-                    next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
-                    next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
-                    target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
+                # Compute next Q-values (min over all critics)
+                next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
+                next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
+                target_q_values.copy_(replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values)
 
-                # Get current Q-values from the critics
+            # Capture the static computation graph
+            with th.cuda.graph(g):
+                # Get current Q-values
                 current_q_values = self.critic(replay_data.observations, replay_data.actions)
 
-                # Compute critic loss (sum of MSE losses across critics)
+                # Compute critic loss
                 critic_loss = sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
 
-                # Optimize the critic
+                # Optimize the critics
                 self.critic.optimizer.zero_grad(set_to_none=True)
                 critic_loss.backward()
                 self.critic.optimizer.step()
 
-                # Delayed policy update
+                # Delayed policy updates
                 if self._n_updates % self.policy_delay == 0:
                     # Compute actor loss
                     actor_loss = -self.critic.q1_forward(replay_data.observations,
@@ -209,17 +215,20 @@ class TD3(OffPolicyAlgorithm):
                     actor_loss.backward()
                     self.actor.optimizer.step()
 
-                    # Perform Polyak averaging
+                    # Perform Polyak averaging for critic and actor networks
                     polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
                     polyak_update(self.actor.parameters(), self.actor_target.parameters(), self.tau)
-                    polyak_update(self.critic_batch_norm_stats, self.critic_batch_norm_stats_target, 1.0)
-                    polyak_update(self.actor_batch_norm_stats, self.actor_batch_norm_stats_target, 1.0)
 
-        # Synchronize the stream
+        # Synchronize CUDA stream
         th.cuda.synchronize()
 
         # Replay the graph
         for _ in range(gradient_steps):
+            # Sample new batch outside the graph and transfer to GPU
+            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+            replay_data = ReplayBufferSamples(*tuple(map(lambda x: x.to('cuda'), replay_data)))
+
+            # Replay the captured computation graph
             g.replay()
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
